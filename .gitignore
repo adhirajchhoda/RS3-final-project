@@ -1,8 +1,15 @@
-install.packages("usethis")     # first time only
-usethis::use_git()              # runs git init, stages .Rproj, opens commit dialog
-.Rproj.user
+ .Rproj.user
 .Rhistory
 .Rdata
 .httr-oauth
 .DS_Store
 .quarto
+examples/
+figures/
+papers/
+FinalProject_files/
+
+RS3+Final+Project+-+2025.pdf
+FinalProject.knit.md
+An Analysis of Market Factors and Investor Sentiment as Determinants of the CBOE SKEW Index.pdf
+An Analysis of Market Factors and Investor Sentiment as Determinants of the CBOE SKEW Index (2).pdf
