@@ -1,0 +1,1021 @@
+---
+title: "An Analysis of Market Factors and Investor Sentiment as Determinants of the CBOE SKEW Index"
+author: "Adhiraj Chhoda"
+date: "2025-05-30"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    toc: yes
+    extra_dependencies: ["dcolumn", "booktabs"]
+  html_document:
+    toc: yes
+    toc_float: yes
+  word_document:
+    toc: yes
+header-includes:
+  - \usepackage{float}
+  - \usepackage{dcolumn}
+  - \usepackage{booktabs}
+  - \newcolumntype{d}[1]{D{.}{.}{#1}}
+---
+
+```{r load-and-initial-prep, echo = TRUE, warning = FALSE, message = FALSE, fig.cap = TRUE}
+
+
+  library(readr)
+  library(readxl)
+  library(dplyr)
+  library(zoo)
+  library(lubridate)
+  library(janitor)
+  library(purrr)
+  library(corrplot)
+  library(stargazer)
+  library(car)
+  library(lmtest) 
+  library(sandwich)
+  library(ggplot2)
+  library(moments)
+  
+  study_start_date <- as.Date("2011-02-23")
+  study_end_date <- as.Date("2019-10-04")
+  
+  sentiment_raw_raw <- read_excel("data/sentiment.xls", col_names = FALSE, .name_repair = "minimal")
+  sentiment_header_rows <- sentiment_raw_raw[2:4, ]
+  sentiment_header_transposed <- t(sentiment_header_rows)
+  sentiment_header_df <- as.data.frame(sentiment_header_transposed, stringsAsFactors = FALSE)
+  sentiment_header_combined <- apply(sentiment_header_df, 1, function(row_vals) {
+    paste(na.omit(as.character(row_vals)), collapse = " ")
+  })
+  sentiment_colnames <- janitor::make_clean_names(sentiment_header_combined)
+  sentiment_raw_data <- read_excel("data/sentiment.xls", skip = 4, col_names = FALSE)
+  colnames(sentiment_raw_data) <- sentiment_colnames
+  
+  skew_raw_data <- read_csv("data/SKEW_History.csv")
+  vix_raw_data <- read_csv("data/VIX_History.csv")
+  returns_spx_levels_raw <- read_csv("data/returns.csv")
+  
+  skew_index_clean <- skew_raw_data %>%
+    rename_with(~"Date_chr", any_of(c("DATE", "Date"))) %>%
+    mutate(Date = mdy(Date_chr)) %>%
+    select(Date, SKEW) %>%
+    filter(!is.na(Date) & !is.na(SKEW) & SKEW != ".") %>%
+    mutate(SKEW = as.numeric(SKEW)) %>%
+    filter(!is.na(SKEW)) %>%
+    arrange(Date) %>%
+    distinct(Date, .keep_all = TRUE)
+  
+  vix_clean <- vix_raw_data %>%
+    rename_with(~"Date_chr", any_of(c("DATE", "Date"))) %>%
+    rename_with(~"VIX_close", any_of(c("CLOSE", "Close", "VIXCLS"))) %>%
+    mutate(Date = mdy(Date_chr)) %>%
+    select(Date, VIX = VIX_close) %>%
+    filter(!is.na(Date) & !is.na(VIX) & VIX != ".") %>%
+    mutate(VIX = as.numeric(VIX)) %>%
+    filter(!is.na(VIX)) %>%
+    arrange(Date) %>%
+    distinct(Date, .keep_all = TRUE)
+  
+  spx_levels_clean <- returns_spx_levels_raw %>%
+    rename_with(~"Date_chr", any_of(c("DATE", "Date"))) %>%
+    rename_with(~"Close_SPX", any_of(c("CLOSE", "Close", "Adj Close"))) %>%
+    mutate(Date = mdy(Date_chr)) %>%
+    select(Date, Close_SPX) %>%
+    filter(!is.na(Date) & !is.na(Close_SPX)) %>%
+    mutate(Close_SPX = as.numeric(Close_SPX)) %>%
+    arrange(Date) %>%
+    distinct(Date, .keep_all = TRUE)
+  
+  sentiment_clean <- sentiment_raw_data %>%
+    mutate(
+      reported_date_as_numeric = suppressWarnings(as.numeric(as.character(reported_date))),
+      Date_temp = case_when(
+        !is.na(reported_date_as_numeric) & reported_date_as_numeric > 0 & reported_date_as_numeric < 60000 ~ excel_numeric_to_date(reported_date_as_numeric),
+        TRUE ~ suppressWarnings(ymd(reported_date)) 
+      )
+    ) %>%
+    filter(!is.na(bullish) & !is.na(Date_temp)) %>%  
+    select(Date = Date_temp, Bullish_val = bullish) %>%
+    mutate(Bullish_val = as.numeric(as.character(Bullish_val))) %>%
+    filter(!is.na(Bullish_val)) %>%
+    arrange(Date) %>%
+    distinct(Date, .keep_all = TRUE)
+  
+  indexpc_archive_raw <- read_csv("data/pc/indexpcarchive.csv", skip = 2, 
+                                  col_types = cols(DATE = col_character(), .default = col_double()),
+                                  show_col_types = FALSE)
+  indexpc_recent_raw <- read_csv("data/pc/indexpc.csv", skip = 2, 
+                                 col_types = cols(DATE = col_character(), .default = col_double()),
+                                 show_col_types = FALSE)
+  
+  colnames(indexpc_archive_raw) <- c("Trade_date_chr", "Call_Volume", "Put_Volume", "Total_Volume", "PC_Ratio")
+  colnames(indexpc_recent_raw) <- c("Trade_date_chr", "Call_Volume", "Put_Volume", "Total_Volume", "PC_Ratio")
+  
+  indexpc_archive_clean <- indexpc_archive_raw %>%
+    mutate(Date = mdy(Trade_date_chr)) %>%
+    select(Date, PC_Ratio)
+  
+  indexpc_recent_clean <- indexpc_recent_raw %>%
+    mutate(Date = mdy(Trade_date_chr)) %>%
+    select(Date, PC_Ratio)
+    
+  combined_pc_clean <- bind_rows(indexpc_archive_clean, indexpc_recent_clean) %>%
+    filter(!is.na(Date) & !is.na(PC_Ratio)) %>%
+    arrange(Date) %>%
+    distinct(Date, .keep_all = TRUE)
+  
+  spx_metrics <- spx_levels_clean %>%
+    arrange(Date) %>%
+    filter(Close_SPX > 0) %>% 
+    mutate(
+      log_return = c(NA, diff(log(Close_SPX))),
+      RealizedVol = rollapplyr(log_return, width = 21, FUN = sd, fill = NA, align = "right", na.rm = TRUE) * sqrt(252),
+      MarketReturn = rollapplyr(log_return, width = 21, FUN = sum, fill = NA, align = "right", na.rm = TRUE)
+    ) %>%
+    select(Date, RealizedVol, MarketReturn)
+  
+  skew_daily_filtered <- skew_index_clean %>%
+    filter(Date >= study_start_date & Date <= study_end_date)
+  
+  vix_daily_filtered <- vix_clean %>%
+    filter(Date >= study_start_date & Date <= study_end_date)
+  
+  spx_metrics_filtered <- spx_metrics %>%
+    filter(Date >= study_start_date & Date <= study_end_date)
+  
+  pc_daily_filtered <- combined_pc_clean %>%
+    filter(Date >= study_start_date & Date <= study_end_date)
+  
+  actual_trading_days_df <- spx_metrics_filtered %>% 
+    select(Date) %>%
+    distinct(Date) %>%
+    arrange(Date)
+  
+  sentiment_daily_processed <- actual_trading_days_df %>%
+    left_join(sentiment_clean, by = "Date") %>% 
+    arrange(Date) %>%
+    mutate(Sentiment_ffill = na.locf(Bullish_val, na.rm = FALSE, fromLast = FALSE)) %>%
+    mutate(Sentiment = na.locf(Sentiment_ffill, na.rm = FALSE, fromLast = TRUE)) %>%
+    select(Date, Sentiment) %>%
+    filter(!is.na(Sentiment))
+  
+  data_list <- list(skew_daily_filtered, 
+                    vix_daily_filtered, 
+                    spx_metrics_filtered, 
+                    pc_daily_filtered, 
+                    sentiment_daily_processed)
+  
+  master_df <- data_list %>%
+    purrr::reduce(~ left_join(.x, .y, by = "Date")) %>%
+    arrange(Date) %>%
+    filter(Date >= study_start_date & Date <= study_end_date) %>%
+    na.omit() 
+  
+  final_model_data <- master_df %>%
+    mutate(
+      VIX_sq = VIX * VIX,
+      VIX_Sentiment_Interaction = VIX * Sentiment 
+    ) %>%
+    arrange(Date) %>%
+    mutate(
+      VIX_lag1 = lag(VIX, 1),
+      VIX_sq_lag1 = lag(VIX_sq, 1),
+      RealizedVol_lag1 = lag(RealizedVol, 1),
+      MarketReturn_lag1 = lag(MarketReturn, 1),
+      Sentiment_lag1 = lag(Sentiment, 1),
+      PC_Ratio_lag1 = lag(PC_Ratio, 1),
+      VIX_Sentiment_Interaction_lag1 = lag(VIX_Sentiment_Interaction, 1)
+    ) %>%
+    mutate(
+      VIX_lag1_centered = VIX_lag1 - mean(VIX_lag1, na.rm = TRUE),
+      Sentiment_lag1_centered = Sentiment_lag1 - mean(Sentiment_lag1, na.rm = TRUE),
+      VIX_Sent_Interact_centered_lag1 = VIX_lag1_centered * Sentiment_lag1_centered
+    ) %>%
+    select(
+      Date,
+      SKEW,
+      VIX_lag1,
+      VIX_sq_lag1,
+      RealizedVol_lag1,
+      MarketReturn_lag1,
+      Sentiment_lag1,
+      PC_Ratio_lag1,
+      VIX_Sentiment_Interaction_lag1,
+      VIX_Sent_Interact_centered_lag1 
+    ) %>%
+    na.omit() 
+```
+
+```{r exploratory-data-analysis, message=FALSE, warning=FALSE}
+  summary(final_model_data[, -1])
+
+  #histograms
+
+  par(mfrow=c(3,3), mar=c(4,4,2,1)) 
+  hist(final_model_data$SKEW, main="SKEW Index", xlab="SKEW", col="skyblue")
+  hist(final_model_data$VIX_lag1, main="Lagged VIX", xlab="VIX (t-1)", col="skyblue")
+  hist(final_model_data$VIX_sq_lag1, main="Lagged VIX Squared", xlab="VIX^2 (t-1)", col="skyblue")
+  hist(final_model_data$RealizedVol_lag1, main="Lagged Realized Vol", xlab="RealizedVol (t-1)", col="skyblue")
+  hist(final_model_data$MarketReturn_lag1, main="Lagged Market Return", xlab="MarketReturn (t-1)", col="skyblue")
+  hist(final_model_data$Sentiment_lag1, main="Lagged Sentiment", xlab="Sentiment (t-1)", col="skyblue")
+  hist(final_model_data$PC_Ratio_lag1, main="Lagged P/C Ratio", xlab="PC_Ratio (t-1)", col="skyblue")
+  hist(final_model_data$VIX_Sentiment_Interaction_lag1, main="Lagged VIX*Sentiment", xlab="VIX*Sent (t-1)", col="skyblue")
+  par(mfrow=c(1,1)) 
+  
+  #boxplots
+  
+  par(mfrow=c(3,3), mar=c(4,4,2,1))
+  boxplot(final_model_data$SKEW, main="SKEW Index", col="lightgreen")
+  boxplot(final_model_data$VIX_lag1, main="Lagged VIX", col="lightgreen")
+  boxplot(final_model_data$VIX_sq_lag1, main="Lagged VIX Squared", col="lightgreen")
+  boxplot(final_model_data$RealizedVol_lag1, main="Lagged Realized Vol", col="lightgreen")
+  boxplot(final_model_data$MarketReturn_lag1, main="Lagged Market Return", col="lightgreen")
+  boxplot(final_model_data$Sentiment_lag1, main="Lagged Sentiment", col="lightgreen")
+  boxplot(final_model_data$PC_Ratio_lag1, main="Lagged P/C Ratio", col="lightgreen")
+  boxplot(final_model_data$VIX_Sentiment_Interaction_lag1, main="Lagged VIX*Sentiment", col="lightgreen")
+  par(mfrow=c(1,1))
+  
+  
+  #correlation plot
+  
+  numeric_cols_for_corr <- final_model_data %>% select(-Date)
+  cor_matrix_full <- cor(numeric_cols_for_corr, use = "complete.obs")
+  corrplot(cor_matrix_full, method = "number", type = "upper", order = "hclust", 
+           tl.col = "black", tl.srt = 45, tl.cex = 0.7, number.cex = 0.6,
+           addCoef.col = "black",
+           cl.cex = 0.7)
+  title("Correlation Matrix of Model Variables", line = 3)
+```
+
+```{r model1-inference, message=FALSE, warning=FALSE, results='asis'}
+
+  model1 <- lm(SKEW ~ VIX_lag1 + VIX_sq_lag1 + RealizedVol_lag1 + 
+                   MarketReturn_lag1 + Sentiment_lag1 + PC_Ratio_lag1 + 
+                   VIX_Sent_Interact_centered_lag1, 
+                 data = final_model_data)
+  summary(model1)
+    
+  my_covariate_labels_m1_centered <- c(
+    "VIX (t-1)", 
+    "VIX$^{2}$ (t-1)", 
+    "Realized Vol (t-1, 21d)", 
+    "Market Return (t-1, 21d)", 
+    "AAII Sentiment (t-1, Bullish \\%)",
+    "SPX Put-Call Ratio (t-1)",
+    "$\\text{VIX}_c\\ (t\\!-\\!1) \\times \\text{Sent}_c\\ (t\\!-\\!1)$"
+  )
+
+
+  stargazer(model1, 
+            type = "latex",
+            title = "Table 1: OLS Regression for SKEW Index (Centered Interaction)",
+            align = TRUE, 
+            dep.var.labels = "CBOE SKEW Index (Daily)",
+            covariate.labels = my_covariate_labels_m1_centered,
+            ci = TRUE, ci.level = 0.95, single.row = FALSE, 
+            omit.stat = c("ser", "rsq", "f"),
+            add.lines = list(
+                c("Observations", formatC(nobs(model1), format="d", big.mark=",")),
+                c("R-squared", format(round(summary(model1)$r.squared, 3), nsmall = 3)),
+                c("Adj. R-squared", format(round(summary(model1)$adj.r.squared, 3), nsmall = 3)),
+                c("F-statistic", paste0(format(round(summary(model1)$fstatistic[["value"]],2),nsmall=2),
+                                      ifelse(pf(summary(model1)$fstatistic[["value"]],
+                                                summary(model1)$fstatistic[["numdf"]],
+                                                summary(model1)$fstatistic[["dendf"]],
+                                                lower.tail=FALSE)<0.001,"^{***}",
+                                             ifelse(pf(summary(model1)$fstatistic[["value"]],
+                                                       summary(model1)$fstatistic[["numdf"]],
+                                                       summary(model1)$fstatistic[["dendf"]],
+                                                       lower.tail=FALSE)<0.01,"^{**}",
+                                                    ifelse(pf(summary(model1)$fstatistic[["value"]],
+                                                              summary(model1)$fstatistic[["numdf"]],
+                                                              summary(model1)$fstatistic[["dendf"]],
+                                                              lower.tail=FALSE)<0.05,"^{*}", ""))),
+                                      " (df = ", summary(model1)$fstatistic[["numdf"]], ", ", summary(model1)$fstatistic[["dendf"]],")"))),
+              star.cutoffs = c(0.05, 0.01, 0.001), 
+              notes = c("$^{*}$p$<$.05; $^{**}$p$<$.01; $^{***}$p$<$.001. OLS Standard Errors."), 
+              notes.align = "l", 
+              notes.append = FALSE,
+              notes.label = "",
+              header = FALSE, 
+              float = FALSE, 
+              no.space = TRUE, 
+              font.size = "small",
+              digits = 3
+      )
+
+```
+
+```{r model1-diagnostics, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, results='asis', fig.height=7, fig.cap="Regression Diagnostic Plots for OLS Model"}
+
+  par(mfrow=c(2,2)) 
+  plot(model1) 
+  par(mfrow=c(1,1))
+  
+  crPlots(model1, 
+        terms = ~ ., 
+        layout = NULL, 
+        ask = FALSE, 
+        smooth = list(smoother = loessLine, col.lines = "blue"),
+        col = "black",
+        pch = 19,      
+        cex = 0.7,
+        main="Component+Residual Plots (Model 1)")     
+
+  print("--- Normality of Residuals ---")
+  shapiro_test_result <- shapiro.test(residuals(model1))
+  print(shapiro_test_result)
+  
+  hist(residuals(model1), main="Histogram of Residuals", xlab="Residuals", breaks=50, col="lightblue")
+  print(paste("Skewness of residuals:", skewness(residuals(model1))))
+  print(paste("Kurtosis of residuals (excess kurtosis):", kurtosis(residuals(model1)) - 3))
+  
+  print("--- Homoscedasticity ---")
+  bp_test_result <- bptest(model1, studentize = FALSE)
+  print(bp_test_result)
+  
+  print("--- Autocorrelation of Residuals ---")
+  dw_test_result <- dwtest(model1)
+  print(dw_test_result)
+  par(mfrow=c(1,2))
+  acf(residuals(model1), main="ACF of Residuals")
+  pacf(residuals(model1), main="PACF of Residuals")
+  par(mfrow=c(1,1))
+  ljung_box_test_10 <- Box.test(residuals(model1), lag = 10, type = "Ljung-Box")
+  ljung_box_test_20 <- Box.test(residuals(model1), lag = 20, type = "Ljung-Box")
+  print("Ljung-Box test for autocorrelation (10 lags):")
+  print(ljung_box_test_10)
+  print("Ljung-Box test for autocorrelation (20 lags):")
+  print(ljung_box_test_20)
+  
+  print("--- Multicollinearity ---")
+  vif_values <- vif(model1)
+  print(vif_values)
+  
+  print("--- Outliers and Influential Points ---")
+  cooksd <- cooks.distance(model1)
+  plot(cooksd, pch="*", cex=1, main="Cook's Distance Plot", ylab="Cook's Distance")
+  abline(h = 4/nobs(model1), col="red", lty=2)
+  influential_threshold_4_n <- 4/nobs(model1)
+  influential_points_4_n <- which(cooksd > influential_threshold_4_n)
+  print(paste("Number of points with Cook's D > 4/n:", length(influential_points_4_n)))
+  if(length(influential_points_4_n) > 0 && length(influential_points_4_n) < 20) {
+      print(paste("Indices of points with Cook's D > 4/n:", paste(head(influential_points_4_n, 10), collapse=", ")))
+  }
+  influential_points_1 <- which(cooksd > 1)
+  print(paste("Number of points with Cook's D > 1:", length(influential_points_1)))
+  if(length(influential_points_1) > 0) {
+      print(paste("Indices of points with Cook's D > 1:", paste(influential_points_1, collapse=", ")))
+  }
+    
+  residuals_df_m1 <- data.frame(Date = final_model_data$Date, Residuals = residuals(model1))
+  p_res_time_m1 <- ggplot(residuals_df_m1, aes(x = Date, y = Residuals)) +
+    geom_line(color = "steelblue") + geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(title = "Model 1 Residuals vs. Time", x = "Date", y = "Residuals") + theme_minimal()
+  print(p_res_time_m1)
+  
+  nw_lag_m1 <- floor(4*(nobs(model1)/100)^(2/9)) 
+  model1_hac_summary <- coeftest(model1, vcov. = NeweyWest(model1, lag = nw_lag_m1, prewhite = FALSE, adjust = TRUE))
+  
+  stargazer(model1, 
+            type = "latex",
+            title = "Table 2: SKEW Index Regression with Newey-West HAC SEs (Model 1)",
+            align = TRUE, 
+            dep.var.labels = "CBOE SKEW Index (Daily)",
+            covariate.labels = my_covariate_labels_m1_centered, 
+            coef = list(coef(model1)),
+            se = list(model1_hac_summary[, "Std. Error"]),
+            t = list(model1_hac_summary[, "t value"]),
+            p = list(model1_hac_summary[, "Pr(>|t|)"]),
+            omit.stat = c("ser", "rsq", "f", "adj.rsq"), 
+            add.lines = list(
+                c("Observations", formatC(nobs(model1), format="d", big.mark=",")),
+                c("R-squared (OLS)", format(round(summary(model1)$r.squared, 3), nsmall = 3)),
+                c("Adj. R-squared (OLS)", format(round(summary(model1)$adj.r.squared, 3), nsmall = 3)),
+                c("Newey-West Lag Chosen", nw_lag_m1),
+                c("Durbin-Watson Stat. (OLS)", format(round(dwtest(model1)$statistic,2),nsmall=2))
+            ),
+            star.cutoffs = c(0.05, 0.01, 0.001), 
+            notes = "$^{*}$p$<$.05; $^{**}$p$<$.01; $^{***}$p$<$.001. Newey-West HAC Standard Errors.",
+            notes.align = "l", notes.append = FALSE, notes.label = "",    
+            header = FALSE, float = FALSE, no.space = TRUE, font.size = "small",
+            digits = 3
+  )
+  
+```
+
+```{r log-transformed-model-inference, echo=TRUE, results='asis', message=FALSE, warning=FALSE}
+
+  final_model_data_log <- final_model_data %>%
+  filter(SKEW > 0 & VIX_lag1 > 0 & RealizedVol_lag1 > 0 & PC_Ratio_lag1 > 0 & Sentiment_lag1 > 0) 
+  
+  final_model_data_log <- final_model_data_log %>%
+    mutate(
+      log_SKEW = log(SKEW),
+      log_VIX_lag1 = log(VIX_lag1),
+      log_RealizedVol_lag1 = log(RealizedVol_lag1),
+      log_PC_Ratio_lag1 = log(PC_Ratio_lag1),
+      log_Sentiment_lag1 = log(Sentiment_lag1) 
+    ) %>%
+    mutate(
+      log_VIX_lag1_centered_logmodel = log_VIX_lag1 - mean(log_VIX_lag1, na.rm=TRUE),
+      log_Sentiment_lag1_centered_logmodel = log_Sentiment_lag1 - mean(log_Sentiment_lag1, na.rm=TRUE),
+      logVIX_logSent_Interact_centered_lag1 = log_VIX_lag1_centered_logmodel * log_Sentiment_lag1_centered_logmodel
+    )
+  
+    model2_log <- lm(log_SKEW ~ log_VIX_lag1 + log_RealizedVol_lag1 + 
+                           MarketReturn_lag1 + log_Sentiment_lag1 + log_PC_Ratio_lag1 +
+                           logVIX_logSent_Interact_centered_lag1, 
+                         data = final_model_data_log)
+    
+    my_covariate_labels_m2_log <- c(
+    "log(VIX (t-1))", 
+    "log(RealizedVol (t-1))", 
+    "Market Return (t-1)", 
+    "log(Sentiment (t-1))", 
+    "log(P/C Ratio (t-1))",
+    "$\\log(\\text{VIX}_c\\ (t{-}1)) \\times \\log(\\text{Sent}_c\\ (t{-}1))$"
+  )
+
+    stargazer(model2_log, 
+              type = "latex",
+              title = "Table 3: OLS Regression for log(SKEW) (Model 2)",
+              align = TRUE, 
+              dep.var.labels = "log(CBOE SKEW Index)",
+              covariate.labels = my_covariate_labels_m2_log,
+              ci = TRUE, ci.level=0.95, single.row=FALSE,
+              omit.stat=c("ser","rsq","f"),
+              add.lines = list(
+                  c("Observations", formatC(nobs(model2_log), format="d", big.mark=",")),
+                  c("R-squared", format(round(summary(model2_log)$r.squared,3),nsmall=3)),
+                  c("Adj. R-squared", format(round(summary(model2_log)$adj.r.squared,3),nsmall=3)),
+                  c("F-statistic", paste0(format(round(summary(model2_log)$fstatistic[["value"]],2),nsmall=2),
+                                      ifelse(pf(summary(model2_log)$fstatistic[["value"]],
+                                                summary(model2_log)$fstatistic[["numdf"]],
+                                                summary(model2_log)$fstatistic[["dendf"]],
+                                                lower.tail=FALSE)<0.001,"^{***}",
+                                             ifelse(pf(summary(model2_log)$fstatistic[["value"]],
+                                                       summary(model2_log)$fstatistic[["numdf"]],
+                                                       summary(model2_log)$fstatistic[["dendf"]],
+                                                       lower.tail=FALSE)<0.01,"^{**}",
+                                                    ifelse(pf(summary(model2_log)$fstatistic[["value"]],
+                                                              summary(model2_log)$fstatistic[["numdf"]],
+                                                              summary(model2_log)$fstatistic[["dendf"]],
+                                                              lower.tail=FALSE)<0.05,"^{*}", ""))),
+                                      " (df = ", summary(model2_log)$fstatistic[["numdf"]], ", ", summary(model2_log)$fstatistic[["dendf"]],")"))
+              ),
+              star.cutoffs = c(0.05, 0.01, 0.001), 
+              notes = "$^{*}$p$<$.05; $^{**}$p$<$.01; $^{***}$p$<$.001. OLS Standard Errors.",
+              notes.align="l", notes.append=FALSE, notes.label="",    
+              header=FALSE, float=FALSE, no.space=TRUE, font.size="small",
+              digits = 3
+    )
+    
+```
+
+```{r model2-diagnostics, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, fig.height=7, fig.cap="Regression Diagnostic Plots for Log Transformed Model"}
+
+  par(mfrow=c(2,2)); plot(model2_log); par(mfrow=c(1,1))
+      
+    crPlots_m2_output <- crPlots(model2_log,
+                                 terms= ~ .,
+                                 layout=NULL,
+                                 ask=FALSE,
+                                 smooth=list(smoother=loessLine,
+                                             col.lines="red",
+                                             spread=FALSE),
+                                 col="darkgray",
+                                 pch=1,
+                                 cex=0.7,
+                                 main="Component+Residual Plots (Model 2)")
+      
+    shapiro_test_m2 <- shapiro.test(residuals(model2_log))
+    hist(residuals(model2_log), breaks=50, main="Residuals Histogram (Model 2)", col="lightcoral")
+    skewness_m2_res <- skewness(residuals(model2_log))
+    kurtosis_m2_res <- kurtosis(residuals(model2_log))-3
+    
+    bp_test_m2 <- bptest(model2_log, studentize=FALSE)
+    
+    dw_test_m2 <- dwtest(model2_log)
+    par(mfrow=c(1,2)); acf(residuals(model2_log), main="ACF Residuals (Model 2)"); pacf(residuals(model2_log), main="PACF Residuals (Model 2)"); par(mfrow=c(1,1))
+    ljung_box_10_m2 <- Box.test(residuals(model2_log), lag=10, type="Ljung-Box")
+    ljung_box_20_m2 <- Box.test(residuals(model2_log), lag=20, type="Ljung-Box")
+      
+    vif_m2 <- vif(model2_log)
+      
+    cooksd_m2 <- cooks.distance(model2_log)
+    plot(cooksd_m2, type="h", pch="*", cex=1, main="Cook's Distance Plot (Model 2)", ylab="Cook's Distance", las=1)
+    abline(h = 4/nobs(model2_log), col="red", lty=2) 
+    influential_threshold_4_n_m2 <- 4/nobs(model2_log)
+    influential_points_4_n_m2 <- which(cooksd_m2 > influential_threshold_4_n_m2)
+      
+    if (!is.null(model2_log$na.action) && length(model2_log$na.action) > 0 && length(final_model_data_log$Date[-na.action(model2_log)]) == length(residuals(model2_log)) ) {
+      residuals_df_m2 <- data.frame(Date = final_model_data_log$Date[-model2_log$na.action], Residuals = residuals(model2_log))
+    } else if (nrow(final_model_data_log) == length(residuals(model2_log))) { 
+       residuals_df_m2 <- data.frame(Date = final_model_data_log$Date, Residuals = residuals(model2_log))
+    } else {
+      residuals_df_m2 <- NULL 
+    }
+    if(!is.null(residuals_df_m2)){
+      p_res_time_m2 <- ggplot(residuals_df_m2, aes(x = Date, y = Residuals)) +
+        geom_line(color = "coral") + geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+        labs(title = "Model 2 (Log) Residuals vs. Time", x = "Date", y = "Residuals") + theme_minimal()
+      print(p_res_time_m2)
+    }
+  
+    cat("\n--- Shapiro-Wilk Normality Test (Model 2) ---\n")
+    print(shapiro_test_m2)
+    cat("\nSkewness (Model 2 Residuals):", round(skewness_m2_res,3), "\n")
+    cat("Excess Kurtosis (Model 2 Residuals):", round(kurtosis_m2_res,3), "\n")
+    cat("\n--- Breusch-Pagan Homoscedasticity Test (Model 2) ---\n")
+    print(bp_test_m2)
+    cat("\n--- Durbin-Watson Autocorrelation Test (Model 2) ---\n")
+    print(dw_test_m2)
+    cat("\n--- Ljung-Box Autocorrelation Test (10 lags, Model 2) ---\n")
+    print(ljung_box_10_m2)
+    cat("\n--- Ljung-Box Autocorrelation Test (20 lags, Model 2) ---\n")
+    print(ljung_box_20_m2)
+    cat("\n--- Variance Inflation Factors (Model 2) ---\n")
+    print(vif_m2)
+    cat("\n--- Influential Points (Model 2) ---\n")
+    cat("Number of points with Cook's D > 4/n:", length(influential_points_4_n_m2), "\n")
+    if(length(influential_points_4_n_m2) > 0 && length(influential_points_4_n_m2) < 20) {
+        cat("Indices of points with Cook's D > 4/n (first 10):", paste(head(influential_points_4_n_m2, 10), collapse=", "), "\n")
+    }
+    influential_points_1_m2 <- which(cooksd_m2 > 1)
+    cat("Number of points with Cook's D > 1:", length(influential_points_1_m2), "\n")
+    if(length(influential_points_1_m2) > 0) {
+        cat("Indices of points with Cook's D > 1:", paste(influential_points_1_m2, collapse=", "), "\n")
+    }
+  
+```
+
+```{r model2-log-hac-table, echo=TRUE, message=FALSE, warning=FALSE, results='asis'}
+
+  nw_lag_m2 <- floor(4*(nobs(model2_log)/100)^(2/9)) 
+  model2_log_hac_summary <- coeftest(model2_log, vcov. = NeweyWest(model2_log, lag = nw_lag_m2, prewhite = FALSE, adjust = TRUE))
+  print(model2_log_hac_summary)
+  
+  colnames(model2_log_hac_summary) <- c("Estimate", "Std. Error", "t value", "Pr(>|t|)")
+      
+
+  stargazer(model2_log, 
+          type = "latex", 
+          title = "Table 4: OLSLog(SKEW) Index Regression with Newey-West HAC SEs (Model 2)",
+          align = TRUE, 
+          dep.var.labels = "log(CBOE SKEW Index)",
+          covariate.labels = my_covariate_labels_m2_log,
+          ci = TRUE, ci.level = 0.95, single.row = FALSE,
+          omit.stat = c("ser", "rsq", "f"), 
+          add.lines = list(
+              c("Observations", formatC(nobs(model2_log), format="d", big.mark=",")),
+              c("R-squared", format(round(summary(model2_log)$r.squared, 3), nsmall = 3)),
+              c("Adj. R-squared", format(round(summary(model2_log)$adj.r.squared, 3), nsmall = 3)),
+              c("F-statistic", paste0(
+                  format(round(summary(model2_log)$fstatistic[["value"]], 2), nsmall=2),
+                  ifelse(pf(summary(model2_log)$fstatistic[["value"]],
+                            summary(model2_log)$fstatistic[["numdf"]], summary(model2_log)$fstatistic[["dendf"]], lower.tail=FALSE) < 0.001, "***",
+                         ifelse(pf(summary(model2_log)$fstatistic[["value"]], summary(model2_log)$fstatistic[["numdf"]], summary(model2_log)$fstatistic[["dendf"]], lower.tail=FALSE) < 0.01, "**",
+                                ifelse(pf(summary(model2_log)$fstatistic[["value"]], summary(model2_log)$fstatistic[["numdf"]], summary(model2_log)$fstatistic[["dendf"]], lower.tail=FALSE) < 0.05, "*", ""))),
+                  " (df = ", summary(model2_log)$fstatistic[["numdf"]], ", ", summary(model2_log)$fstatistic[["dendf"]], ")"))
+          ),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          notes = c("$^{*}$p$<$.05; $^{**}$p$<$.01; $^{***}$p$<$.001. Newey-West HAC Standard Errors."),
+          notes.align = "l", 
+          notes.append = FALSE, 
+          header = FALSE, 
+          float = FALSE,
+          no.space = TRUE, 
+          font.size = "small", 
+          digits = 3)
+```
+
+```{r model3-parsimonious-log-log, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, fig.height=5, fig.cap="Standard Diagnostic Plots for Model 3 (OLS)"}
+
+  model3_log <- lm(log_SKEW ~ log_VIX_lag1 + log_RealizedVol_lag1 + log_PC_Ratio_lag1,
+                     data = final_model_data_log)
+  
+  summary(model3_log)
+  
+  par(mfrow=c(2,2)); plot(model3_log); par(mfrow=c(1,1))
+  crPlots(model3_log, terms = ~ ., layout=NULL, ask=FALSE, smooth=list(smoother=loessLine, col.lines="purple", spread=FALSE), col="darkgrey", pch=1, cex=0.7, main="Component+Residual Plots (Model 3 OLS)")
+
+  
+  cat("\n-- Normality of Residuals --\n")
+  hist(residuals(model3_log), breaks=50, main="Histogram of Residuals (Model 3 OLS)", col="salmon")
+  shapiro_test_m3 <- shapiro.test(residuals(model3_log))
+  print(shapiro_test_m3)
+  cat("Skewness (Model 3 OLS Residuals):", skewness(residuals(model3_log)), "\n")
+  cat("Excess Kurtosis (Model 3 OLS Residuals):", kurtosis(residuals(model3_log)) - 3, "\n")
+  
+  cat("\n-- Homoscedasticity (Breusch-Pagan Test) --\n")
+  bp_test_m3 <- bptest(model3_log, studentize=FALSE)
+  print(bp_test_m3)
+  
+  cat("\n-- Independence of Residuals (Durbin-Watson & Ljung-Box) --\n")
+  dw_test_m3 <- dwtest(model3_log)
+  print(dw_test_m3)
+  par(mfrow=c(1,2)); acf(residuals(model3_log), main="ACF Residuals (Model 3 OLS)"); pacf(residuals(model3_log), main="PACF Residuals (Model 3 OLS)"); par(mfrow=c(1,1))
+  ljung_box_10_m3 <- Box.test(residuals(model3_log), lag=10, type="Ljung-Box")
+  print(ljung_box_10_m3)
+  
+  cat("\n-- Multicollinearity (VIFs) --\n")
+  vif_m3 <- vif(model3_log)
+  print(vif_m3)
+  
+  cat("\n-- Influential Points (Cook's Distance) --\n")
+  cooksd_m3 <- cooks.distance(model3_log)
+  plot(cooksd_m3, type="h", main="Cook's Distance Plot (Model 3 OLS)", ylab="Cook's Distance")
+  abline(h = 4/nobs(model3_log), col="darkred", lty=2)
+  
+  cat("\n--- Model 3 with HAC Standard Errors ---\n")
+  nw_lag_m3 <- floor(4*(nobs(model3_log)/100)^(2/9))
+  model3_log_hac_summary <- coeftest(model3_log, vcov. = NeweyWest(model3_log, lag = nw_lag_m3, prewhite = FALSE, adjust = TRUE))
+  print(model3_log_hac_summary)
+  
+  cat("\n--- Stargazer Table for Model 3 (HAC SEs) ---\n")
+  my_covariate_labels_m3_log <- c(
+    "log(VIX (t-1))",
+    "log(RealizedVol (t-1))",
+    "log(P/C Ratio (t-1))"
+  )
+  
+  nw_lag_m3_for_table <- floor(4*(nobs(model3_log)/100)^(2/9))
+  model3_log_hac_summary <- coeftest(model3_log, vcov. = NeweyWest(model3_log, lag = nw_lag_m3_for_table, prewhite = FALSE, adjust = TRUE))
+  dw_test_m3 <- dwtest(model3_log)
+
+
+  
+  my_covariate_labels_m3_log <- c(
+    "log(VIX (t-1))",
+    "log(RealizedVol (t-1))",
+    "log(P/C Ratio (t-1))"
+  )
+
+```
+
+```{r model3--table, echo=TRUE, warning=FALSE, results='asis'}
+
+stargazer(model3_log,
+          type = "latex",
+          title = "Table 5: Parsimonious Log(SKEW) Index Regression with Newey-West HAC SEs (Model 3)",
+          align = TRUE,
+          dep.var.labels = "log(CBOE SKEW Index)",
+          covariate.labels = my_covariate_labels_m3_log,
+          coef = list(coef(model3_log)),
+          se = list(model3_log_hac_summary[, "Std. Error"]),
+          t = list(model3_log_hac_summary[, "t value"]),
+          p = list(model3_log_hac_summary[, "Pr(>|t|)"]),
+          ci = TRUE, 
+          omit.stat = c("ser", "f", "bic", "aic", "ll"),
+          add.lines = list(
+            c("Observations", formatC(nobs(model3_log), format="d", big.mark=",")),
+            c("R-squared (OLS)", format(round(summary(model3_log)$r.squared, 3), nsmall = 3)),
+            c("Adj. R-squared (OLS)", format(round(summary(model3_log)$adj.r.squared, 3), nsmall = 3)),
+            c("Newey-West Lag Chosen", nw_lag_m3_for_table),
+            c("Durbin-Watson Stat. (OLS)", format(round(dw_test_m3$statistic, 2), nsmall=2))
+          ),
+          star.cutoffs = c(0.05, 0.01, 0.001),
+          notes = "$^{*}$p$<$.05; $^{**}$p$<$.01; $^{***}$p$<$.001. Newey-West HAC Standard Errors.",
+          notes.align = "l",
+          notes.append = FALSE,
+          header = FALSE,
+          float = FALSE,
+          no.space = TRUE,
+          font.size = "small",
+          digits = 3)
+          
+```
+
+```{r cross-validation, echo=TRUE, message=FALSE, warning=FALSE}
+  
+  calculate_rmse <- function(actual, predicted) {
+    sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+  }
+  
+  calculate_rsquared_oos <- function(actual, predicted) {
+    tss <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+    rss <- sum((actual - predicted)^2, na.rm = TRUE)
+    if (tss == 0) return(NA)
+    return(1 - (rss / tss))
+  }
+  
+  cat("\n--- Model 1 (Levels): Rolling Origin k-Fold Cross-Validation ---\n")
+  data_for_cv_m1 <- final_model_data
+  k_folds_m1 <- 5
+  n_obs_m1 <- nrow(data_for_cv_m1)
+  initial_train_percent_m1 <- 0.70
+  initial_train_window_m1 <- floor(initial_train_percent_m1 * n_obs_m1)
+  remaining_obs_m1 <- n_obs_m1 - initial_train_window_m1
+  fold_size_m1 <- floor(remaining_obs_m1 / k_folds_m1)
+  
+  rmse_scores_m1 <- numeric(k_folds_m1)
+  rsquared_oos_scores_m1 <- numeric(k_folds_m1)
+  
+  model1_formula_cv <- SKEW ~ VIX_lag1 + VIX_sq_lag1 + RealizedVol_lag1 +
+                              MarketReturn_lag1 + Sentiment_lag1 + PC_Ratio_lag1 +
+                              VIX_Sent_Interact_centered_lag1
+  
+  if (fold_size_m1 > 0) {
+    for (i in 1:k_folds_m1) {
+      train_end_idx <- initial_train_window_m1 + (i - 1) * fold_size_m1
+      test_start_idx <- train_end_idx + 1
+      if (i < k_folds_m1) {
+        test_end_idx <- train_end_idx + fold_size_m1
+      } else {
+        test_end_idx <- n_obs_m1
+      }
+  
+      if (test_start_idx > n_obs_m1) {
+        rmse_scores_m1[i] <- NA
+        rsquared_oos_scores_m1[i] <- NA
+        cat(paste("Fold", i, "(Model 1): No test data remaining. Skipping.\n"))
+        next
+      }
+      
+      current_train_data_m1 <- data_for_cv_m1[1:train_end_idx, ]
+      current_test_data_m1  <- data_for_cv_m1[test_start_idx:test_end_idx, ]
+  
+      if (nrow(current_test_data_m1) == 0) {
+          rmse_scores_m1[i] <- NA
+          rsquared_oos_scores_m1[i] <- NA
+          cat(paste("Fold", i, "(Model 1): Test data has 0 rows. Skipping.\n"))
+          next
+      }
+  
+      model_fit_cv_m1 <- lm(model1_formula_cv, data = current_train_data_m1)
+      predictions_cv_m1 <- predict(model_fit_cv_m1, newdata = current_test_data_m1)
+      actuals_cv_m1 <- current_test_data_m1$SKEW
+      
+      rmse_scores_m1[i] <- calculate_rmse(actuals_cv_m1, predictions_cv_m1)
+      rsquared_oos_scores_m1[i] <- calculate_rsquared_oos(actuals_cv_m1, predictions_cv_m1)
+      
+      cat(paste("Fold", i, "RMSE (Model 1, levels):", round(rmse_scores_m1[i], 4), 
+                "| OOS R-squared (Model 1, levels):", round(rsquared_oos_scores_m1[i], 4),
+                "| Train Size:", nrow(current_train_data_m1), 
+                "| Test Size:", nrow(current_test_data_m1), "\n"))
+    }
+    
+    mean_cv_rmse_m1 <- mean(rmse_scores_m1, na.rm = TRUE)
+    sd_cv_rmse_m1 <- sd(rmse_scores_m1, na.rm = TRUE)
+    mean_cv_rsquared_oos_m1 <- mean(rsquared_oos_scores_m1, na.rm = TRUE)
+    
+    cat(paste("\nAverage Cross-Validated RMSE (Model 1, levels):", round(mean_cv_rmse_m1, 4), "\n"))
+    cat(paste("Std Dev of Cross-Validated RMSE (Model 1, levels):", round(sd_cv_rmse_m1, 4), "\n"))
+    cat(paste("Average Out-of-Sample R-squared (Model 1, levels):", round(mean_cv_rsquared_oos_m1, 4), "\n"))
+    
+  } else {
+    cat("Fold size for Model 1 CV is 0. Increase k_folds or adjust initial_train_percent_m1.\n")
+  }
+  
+  
+  cat("\n\n--- Model 2 (Log-Log): Rolling Origin k-Fold Cross-Validation ---\n")
+  data_for_cv_m2 <- final_model_data_log
+  k_folds_m2 <- 5
+  n_obs_m2 <- nrow(data_for_cv_m2)
+  initial_train_percent_m2 <- 0.70
+  initial_train_window_m2 <- floor(initial_train_percent_m2 * n_obs_m2)
+  remaining_obs_m2 <- n_obs_m2 - initial_train_window_m2
+  fold_size_m2 <- floor(remaining_obs_m2 / k_folds_m2)
+  
+  rmse_scores_m2 <- numeric(k_folds_m2)
+  rsquared_oos_scores_m2 <- numeric(k_folds_m2)
+  
+  model2_formula_cv <- log_SKEW ~ log_VIX_lag1 + log_RealizedVol_lag1 +
+                                 MarketReturn_lag1 + log_Sentiment_lag1 + log_PC_Ratio_lag1 +
+                                 logVIX_logSent_Interact_centered_lag1
+  
+  if (fold_size_m2 > 0) {
+    for (i in 1:k_folds_m2) {
+      train_end_idx <- initial_train_window_m2 + (i - 1) * fold_size_m2
+      test_start_idx <- train_end_idx + 1
+      if (i < k_folds_m2) {
+        test_end_idx <- train_end_idx + fold_size_m2
+      } else {
+        test_end_idx <- n_obs_m2 
+      }
+  
+      if (test_start_idx > n_obs_m2) {
+        rmse_scores_m2[i] <- NA
+        rsquared_oos_scores_m2[i] <- NA
+        cat(paste("Fold", i, "(Model 2): No test data remaining. Skipping.\n"))
+        next
+      }
+      
+      current_train_data_m2 <- data_for_cv_m2[1:train_end_idx, ]
+      current_test_data_m2  <- data_for_cv_m2[test_start_idx:test_end_idx, ]
+  
+      if (nrow(current_test_data_m2) == 0) {
+          rmse_scores_m2[i] <- NA
+          rsquared_oos_scores_m2[i] <- NA
+          cat(paste("Fold", i, "(Model 2): Test data has 0 rows. Skipping.\n"))
+          next
+      }
+      
+      model_fit_cv_m2 <- lm(model2_formula_cv, data = current_train_data_m2)
+      predictions_cv_m2 <- predict(model_fit_cv_m2, newdata = current_test_data_m2)
+      actuals_cv_m2 <- current_test_data_m2$log_SKEW
+      
+      rmse_scores_m2[i] <- calculate_rmse(actuals_cv_m2, predictions_cv_m2)
+      rsquared_oos_scores_m2[i] <- calculate_rsquared_oos(actuals_cv_m2, predictions_cv_m2)
+      
+      cat(paste("Fold", i, "RMSE (Model 2, log-scale):", round(rmse_scores_m2[i], 4), 
+                "| OOS R-squared (Model 2, log-scale):", round(rsquared_oos_scores_m2[i], 4),
+                "| Train Size:", nrow(current_train_data_m2), 
+                "| Test Size:", nrow(current_test_data_m2), "\n"))
+    }
+    
+    mean_cv_rmse_m2 <- mean(rmse_scores_m2, na.rm = TRUE)
+    sd_cv_rmse_m2 <- sd(rmse_scores_m2, na.rm = TRUE)
+    mean_cv_rsquared_oos_m2 <- mean(rsquared_oos_scores_m2, na.rm = TRUE)
+    
+    cat(paste("\nAverage Cross-Validated RMSE (Model 2, log-scale):", round(mean_cv_rmse_m2, 4), "\n"))
+    cat(paste("Std Dev of Cross-Validated RMSE (Model 2, log-scale):", round(sd_cv_rmse_m2, 4), "\n"))
+    cat(paste("Average Out-of-Sample R-squared (Model 2, log-scale):", round(mean_cv_rsquared_oos_m2, 4), "\n"))
+    
+  } else {
+    cat("Fold size for Model 2 CV is 0. Increase k_folds or adjust initial_train_percent_m2.\n")
+  }
+    
+    
+    cat("\n\n--- Model 3 (Parsimonious Log-Log): Rolling Origin k-Fold Cross-Validation ---\n")
+  data_for_cv_m3 <- final_model_data_log
+  k_folds_m3 <- 5
+  n_obs_m3 <- nrow(data_for_cv_m3)
+  initial_train_percent_m3 <- 0.70
+  initial_train_window_m3 <- floor(initial_train_percent_m3 * n_obs_m3)
+  remaining_obs_m3 <- n_obs_m3 - initial_train_window_m3
+  fold_size_m3 <- floor(remaining_obs_m3 / k_folds_m3)
+  
+  rmse_scores_m3 <- numeric(k_folds_m3)
+  rsquared_oos_scores_m3 <- numeric(k_folds_m3)
+  
+  model3_formula_cv <- log_SKEW ~ log_VIX_lag1 + log_RealizedVol_lag1 + log_PC_Ratio_lag1
+  
+  if (fold_size_m3 > 0) {
+    for (i in 1:k_folds_m3) {
+      train_end_idx <- initial_train_window_m3 + (i - 1) * fold_size_m3
+      test_start_idx <- train_end_idx + 1
+      if (i < k_folds_m3) {
+        test_end_idx <- train_end_idx + fold_size_m3
+      } else {
+        test_end_idx <- n_obs_m3 
+      }
+  
+      if (test_start_idx > n_obs_m3) {
+        rmse_scores_m3[i] <- NA
+        rsquared_oos_scores_m3[i] <- NA
+        cat(paste("Fold", i, "(Model 3): No test data remaining. Skipping.\n"))
+        next
+      }
+      
+      current_train_data_m3 <- data_for_cv_m3[1:train_end_idx, ]
+      current_test_data_m3  <- data_for_cv_m3[test_start_idx:test_end_idx, ]
+  
+      if (nrow(current_test_data_m3) == 0) {
+          rmse_scores_m3[i] <- NA
+          rsquared_oos_scores_m3[i] <- NA
+          cat(paste("Fold", i, "(Model 3): Test data has 0 rows. Skipping.\n"))
+          next
+      }
+      
+      model_fit_cv_m3 <- lm(model3_formula_cv, data = current_train_data_m3)
+      predictions_cv_m3 <- predict(model_fit_cv_m3, newdata = current_test_data_m3)
+      actuals_cv_m3 <- current_test_data_m3$log_SKEW
+      
+      rmse_scores_m3[i] <- calculate_rmse(actuals_cv_m3, predictions_cv_m3)
+      rsquared_oos_scores_m3[i] <- calculate_rsquared_oos(actuals_cv_m3, predictions_cv_m3)
+      
+      cat(paste("Fold", i, "RMSE (Model 3, log-scale):", round(rmse_scores_m3[i], 4), 
+                "| OOS R-squared (Model 3, log-scale):", round(rsquared_oos_scores_m3[i], 4),
+                "| Train Size:", nrow(current_train_data_m3), 
+                "| Test Size:", nrow(current_test_data_m3), "\n"))
+    }
+    
+    mean_cv_rmse_m3 <- mean(rmse_scores_m3, na.rm = TRUE)
+    sd_cv_rmse_m3 <- sd(rmse_scores_m3, na.rm = TRUE)
+    mean_cv_rsquared_oos_m3 <- mean(rsquared_oos_scores_m3, na.rm = TRUE)
+    
+    cat(paste("\nAverage Cross-Validated RMSE (Model 3, log-scale):", round(mean_cv_rmse_m3, 4), "\n"))
+    cat(paste("Std Dev of Cross-Validated RMSE (Model 3, log-scale):", round(sd_cv_rmse_m3, 4), "\n"))
+    cat(paste("Average Out-of-Sample R-squared (Model 3, log-scale):", round(mean_cv_rsquared_oos_m3, 4), "\n"))
+    
+  } else {
+    cat("Fold size for Model 3 CV is 0. Increase k_folds or adjust initial_train_percent_m3.\n")
+  }
+  
+```
+
+```{r model2-subperiod-analysis, echo=FALSE, message=TRUE, warning=TRUE}
+
+cat("\n--- Model 2 (Log-Log): Sub-Period Robustness Analysis ---\n")
+
+n_obs_m2_full <- nrow(final_model_data_log)
+mid_point_m2 <- floor(n_obs_m2_full / 2)
+
+sub_period1_data_m2 <- final_model_data_log[1:mid_point_m2, ]
+sub_period2_data_m2 <- final_model_data_log[(mid_point_m2 + 1):n_obs_m2_full, ]
+
+cat(paste("\nSub-Period 1: Observations 1 to", mid_point_m2, "(", nrow(sub_period1_data_m2), "obs )\n"))
+cat(paste("Sub-Period 2: Observations", mid_point_m2 + 1, "to", n_obs_m2_full, "(", nrow(sub_period2_data_m2), "obs )\n"))
+
+cat("\n-- Model 2 on Sub-Period 1 --\n")
+model2_sub1 <- lm(model2_formula_cv, data = sub_period1_data_m2)
+summary(model2_sub1)
+
+cat("\nDiagnostics for Model 2 - Sub-Period 1:\n")
+dw_test_m2_sub1 <- dwtest(model2_sub1)
+print(dw_test_m2_sub1)
+
+nw_lag_m2_sub1 <- floor(4*(nobs(model2_sub1)/100)^(2/9))
+model2_sub1_hac_summary <- coeftest(model2_sub1, vcov. = NeweyWest(model2_sub1, lag = nw_lag_m2_sub1, prewhite = FALSE, adjust = TRUE))
+cat("\nModel 2 Sub-Period 1 - HAC Corrected Coefficients:\n")
+print(model2_sub1_hac_summary)
+
+cat("\n\n-- Model 2 on Sub-Period 2 --\n")
+model2_sub2 <- lm(model2_formula_cv, data = sub_period2_data_m2)
+summary(model2_sub2)
+
+cat("\nDiagnostics for Model 2 - Sub-Period 2:\n")
+dw_test_m2_sub2 <- dwtest(model2_sub2)
+print(dw_test_m2_sub2)
+
+nw_lag_m2_sub2 <- floor(4*(nobs(model2_sub2)/100)^(2/9))
+model2_sub2_hac_summary <- coeftest(model2_sub2, vcov. = NeweyWest(model2_sub2, lag = nw_lag_m2_sub2, prewhite = FALSE, adjust = TRUE))
+cat("\nModel 2 Sub-Period 2 - HAC Corrected Coefficients:\n")
+print(model2_sub2_hac_summary)
+
+cat("\n\n--- Summary Comparison (HAC Corrected Estimates) ---\n")
+cat("Variable                          | Full Period (Model 2b) | Sub-Period 1         | Sub-Period 2         |\n")
+cat("----------------------------------|------------------------|----------------------|----------------------|\n")
+
+vars_to_compare <- rownames(model2_log_hac_summary)
+
+for(var_name in vars_to_compare){
+  full_est <- model2_log_hac_summary[var_name, "Estimate"]
+  full_pval <- model2_log_hac_summary[var_name, "Pr(>|t|)"]
+  
+  sub1_est <- ifelse(var_name %in% rownames(model2_sub1_hac_summary), model2_sub1_hac_summary[var_name, "Estimate"], NA)
+  sub1_pval <- ifelse(var_name %in% rownames(model2_sub1_hac_summary), model2_sub1_hac_summary[var_name, "Pr(>|t|)"], NA)
+  
+  sub2_est <- ifelse(var_name %in% rownames(model2_sub2_hac_summary), model2_sub2_hac_summary[var_name, "Estimate"], NA)
+  sub2_pval <- ifelse(var_name %in% rownames(model2_sub2_hac_summary), model2_sub2_hac_summary[var_name, "Pr(>|t|)"], NA)
+  
+  cat(sprintf("%-33s | Est: %8.4f (p: %.3f) | Est: %8.4f (p: %.3f) | Est: %8.4f (p: %.3f) |\n", 
+              var_name, 
+              full_est, full_pval,
+              sub1_est, sub1_pval,
+              sub2_est, sub2_pval))
+}
+
+cat(paste("\nAdj. R-sq (Full OLS Model 2a):", round(summary(model2_log)$adj.r.squared, 3)))
+cat(paste("\nAdj. R-sq (Sub-Period 1 OLS):", round(summary(model2_sub1)$adj.r.squared, 3)))
+cat(paste("\nAdj. R-sq (Sub-Period 2 OLS):", round(summary(model2_sub2)$adj.r.squared, 3), "\n"))
+
+```
+
+```{r model2b-significant-results-table, echo=FALSE, results='asis', message=FALSE, warning=FALSE}
+
+  add_significance_stars <- function(p_value) {
+    if (is.na(p_value)) return("")
+    if (p_value < 0.001) return("***")
+    if (p_value < 0.01)  return("**")
+    if (p_value < 0.05)  return("*")
+    return("")
+  
+  p_values_m2b <- model2_log_hac_summary[, "Pr(>|t|)"]
+  significance_stars_m2b <- sapply(p_values_m2b, add_significance_stars)
+  
+  significant_vars_to_show_m2b <- c("log_VIX_lag1", "log_RealizedVol_lag1", "log_PC_Ratio_lag1")
+  
+  actual_vars_in_summary <- rownames(model2_log_hac_summary)
+  vars_to_include <- intersect(significant_vars_to_show_m2b, actual_vars_in_summary)
+  
+  if (length(vars_to_include) > 0) {
+    table_data_m2b <- data.frame(
+      Variable = vars_to_include,
+      Coefficient = model2_log_hac_summary[vars_to_include, "Estimate"],
+      Significance = significance_stars_m2b[vars_to_include]
+    )
+    
+    table_data_m2b <- table_data_m2b[match(significant_vars_to_show_m2b, table_data_m2b$Variable), ]
+    rownames(table_data_m2b) <- NULL
+        
+    table_data_m2b$Coefficient <- sprintf("%.3f", table_data_m2b$Coefficient)
+    
+    adj_r_squared_m2 <- summary(model2_log)$adj.r.squared 
+    table_caption_m2b <- paste0("Significant Results from Model 2b (Log-Log with HAC SEs). Adjusted R-squared (OLS): ", 
+                                sprintf("%.3f", adj_r_squared_m2), ".")
+
+    kable(table_data_m2b, caption = table_caption_m2b, format = "pipe", align = 'lcr') # lcr: Variable (L), Coef (C), Sig (R)
+  
+  } else {
+    cat("None of the specified significant variables were found in the Model 2b HAC summary.\n")
+  }
+  
+} else {
+  cat("Error: `model2_log_hac_summary` or `model2_log` object not found. Please ensure they are created before this chunk.\n")
+}
+
+```
+

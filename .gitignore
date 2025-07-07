@@ -1,0 +1,8 @@
+install.packages("usethis")     # first time only
+usethis::use_git()              # runs git init, stages .Rproj, opens commit dialog
+.Rproj.user
+.Rhistory
+.Rdata
+.httr-oauth
+.DS_Store
+.quarto
